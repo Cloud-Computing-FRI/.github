@@ -1,7 +1,7 @@
 # Delivery app (Cloud Computing, UL FRI)
 
 A small food delivery application split into isolated microservices. Each service
-lives in its own repository, owns its own database, and talks to the others only
+lives in its own repository, uses its own database, and talks to the others only
 over HTTP through adapters.
 
 | Repository | Role |
@@ -11,7 +11,7 @@ over HTTP through adapters.
 | [delivery-app-notifications](https://github.com/Cloud-Computing-FRI/delivery-app-notifications) | Order notifications |
 | [delivery-app-ui](https://github.com/Cloud-Computing-FRI/delivery-app-ui) | Web frontend and `/api` proxy |
 
-Every repository carries its own Helm chart under `helm/` and the same CI/CD
+Every repository includes its own Helm chart under `helm/` and the same CI/CD
 workflow under `.github/workflows/ci-cd.yml`. This page documents the parts that
 are shared across all four, so the individual repositories do not repeat them.
 
@@ -46,7 +46,7 @@ Set these in every service repository under
 | `AZURE_CLIENT_ID` | Client ID of the user-assigned managed identity (OIDC) |
 | `AZURE_TENANT_ID` | Azure tenant ID |
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
-| `AKS_RESOURCE_GROUP` | Resource group holding the AKS cluster |
+| `AKS_RESOURCE_GROUP` | Resource group the AKS cluster belongs to |
 | `AKS_CLUSTER_NAME` | AKS cluster name |
 
 ### Retrieving the values with the Azure CLI
@@ -65,18 +65,24 @@ az account show --query tenantId -o tsv   # AZURE_TENANT_ID
 az account show --query id -o tsv         # AZURE_SUBSCRIPTION_ID
 ```
 
-Find the AKS cluster and its resource group:
+Find the AKS cluster and its resource group, and keep them in variables that the
+commands below reuse:
 
 ```bash
-az aks list --query "[].{name:name, resourceGroup:resourceGroup}" -o table
-# the two columns are AKS_CLUSTER_NAME and AKS_RESOURCE_GROUP
+rg=$(az aks list --query "[0].resourceGroup" -o tsv)   # AKS_RESOURCE_GROUP
+cluster=$(az aks list --query "[0].name" -o tsv)       # AKS_CLUSTER_NAME
+echo "$rg / $cluster"
 ```
+
+If the subscription contains more than one cluster, replace `[0]` with the index of
+yours (`az aks list -o table` shows them all). The variables only live in the
+current shell, so run the later blocks in the same session.
 
 Create the managed identity the workflow logs in as, then read its client ID:
 
 ```bash
-az identity create --name delivery-ci --resource-group <rg>
-az identity show  --name delivery-ci --resource-group <rg> --query clientId -o tsv   # AZURE_CLIENT_ID
+az identity create --name delivery-ci --resource-group "$rg"
+az identity show  --name delivery-ci --resource-group "$rg" --query clientId -o tsv   # AZURE_CLIENT_ID
 ```
 
 Because login uses OIDC, no client secret is stored. Add one federated
@@ -88,7 +94,7 @@ for repo in delivery-app-restaurants delivery-app-orders delivery-app-notificati
     az identity federated-credential create \
       --name "${repo}-${env}" \
       --identity-name delivery-ci \
-      --resource-group <rg> \
+      --resource-group "$rg" \
       --issuer https://token.actions.githubusercontent.com \
       --subject "repo:Cloud-Computing-FRI/${repo}:environment:${env}" \
       --audience api://AzureADTokenExchange
@@ -99,8 +105,8 @@ done
 Give that identity access to pull the kubeconfig and deploy into the cluster:
 
 ```bash
-clientId=$(az identity show --name delivery-ci --resource-group <rg> --query clientId -o tsv)
-clusterId=$(az aks show --name <cluster> --resource-group <rg> --query id -o tsv)
+clientId=$(az identity show --name delivery-ci --resource-group "$rg" --query clientId -o tsv)
+clusterId=$(az aks show --name "$cluster" --resource-group "$rg" --query id -o tsv)
 az role assignment create --assignee "$clientId" \
   --role "Azure Kubernetes Service Cluster User Role" --scope "$clusterId"
 # For an AKS cluster with Azure RBAC, also grant a write role such as
@@ -115,7 +121,7 @@ The two Docker Hub values come from Docker Hub itself. Create the token under
 With the values in hand, push them to all four repositories at once:
 
 ```bash
-clientId=$(az identity show --name delivery-ci --resource-group <rg> --query clientId -o tsv)
+clientId=$(az identity show --name delivery-ci --resource-group "$rg" --query clientId -o tsv)
 tenantId=$(az account show --query tenantId -o tsv)
 subId=$(az account show --query id -o tsv)
 
@@ -123,8 +129,8 @@ for repo in delivery-app-restaurants delivery-app-orders delivery-app-notificati
   gh secret set AZURE_CLIENT_ID       --repo "Cloud-Computing-FRI/$repo" --body "$clientId"
   gh secret set AZURE_TENANT_ID       --repo "Cloud-Computing-FRI/$repo" --body "$tenantId"
   gh secret set AZURE_SUBSCRIPTION_ID --repo "Cloud-Computing-FRI/$repo" --body "$subId"
-  gh secret set AKS_RESOURCE_GROUP    --repo "Cloud-Computing-FRI/$repo" --body "<rg>"
-  gh secret set AKS_CLUSTER_NAME      --repo "Cloud-Computing-FRI/$repo" --body "<cluster>"
+  gh secret set AKS_RESOURCE_GROUP    --repo "Cloud-Computing-FRI/$repo" --body "$rg"
+  gh secret set AKS_CLUSTER_NAME      --repo "Cloud-Computing-FRI/$repo" --body "$cluster"
   gh secret set DOCKERHUB_USERNAME    --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-username>"
   gh secret set DOCKERHUB_TOKEN       --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-token>"
 done
@@ -136,7 +142,9 @@ Point `kubectl` at the AKS cluster. This merges the credentials into your
 `~/.kube/config`:
 
 ```bash
-az aks get-credentials --resource-group <rg> --name <cluster>
+rg=$(az aks list --query "[0].resourceGroup" -o tsv)
+cluster=$(az aks list --query "[0].name" -o tsv)
+az aks get-credentials --resource-group "$rg" --name "$cluster"
 ```
 
 Each environment is a namespace (`staging`, `prod`). Inspect what is running:
