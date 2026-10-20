@@ -51,6 +51,10 @@ Set these in every service repository under
 
 ### Retrieving the values with the Azure CLI
 
+The snippets below are written for bash. Where PowerShell syntax differs
+(variables, loops, line continuation), a PowerShell version follows. Commands
+that only call `az`, `gh`, `kubectl` or `helm` are identical in both shells.
+
 Sign in:
 
 ```bash
@@ -73,6 +77,14 @@ cluster=$(az aks list --query "[0].name" -o tsv)       # AKS_CLUSTER_NAME
 echo "$rg / $cluster"
 ```
 
+PowerShell:
+
+```powershell
+$rg = az aks list --query "[0].resourceGroup" -o tsv   # AKS_RESOURCE_GROUP
+$cluster = az aks list --query "[0].name" -o tsv       # AKS_CLUSTER_NAME
+"$rg / $cluster"
+```
+
 If the subscription contains more than one cluster, replace `[0]` with the index of
 yours (`az aks list -o table` shows them all). The variables only live in the
 current shell, so run the later blocks in the same session.
@@ -82,6 +94,13 @@ Create the managed identity the workflow logs in as, then read its client ID:
 ```bash
 az identity create --name delivery-ci --resource-group "$rg"
 az identity show  --name delivery-ci --resource-group "$rg" --query clientId -o tsv   # AZURE_CLIENT_ID
+```
+
+In PowerShell the same two commands work unchanged with `$rg`:
+
+```powershell
+az identity create --name delivery-ci --resource-group $rg
+az identity show  --name delivery-ci --resource-group $rg --query clientId -o tsv   # AZURE_CLIENT_ID
 ```
 
 Because login uses OIDC, no client secret is stored. Add one federated
@@ -101,6 +120,23 @@ for repo in delivery-app-restaurants delivery-app-orders delivery-app-notificati
 done
 ```
 
+PowerShell:
+
+```powershell
+$repos = "delivery-app-restaurants", "delivery-app-orders", "delivery-app-notifications", "delivery-app-ui"
+foreach ($repo in $repos) {
+  foreach ($env in "staging", "prod") {
+    az identity federated-credential create `
+      --name "$repo-$env" `
+      --identity-name delivery-ci `
+      --resource-group $rg `
+      --issuer https://token.actions.githubusercontent.com `
+      --subject "repo:Cloud-Computing-FRI/${repo}:environment:$env" `
+      --audience api://AzureADTokenExchange
+  }
+}
+```
+
 Give that identity access to pull the kubeconfig and deploy into the cluster:
 
 ```bash
@@ -108,6 +144,17 @@ clientId=$(az identity show --name delivery-ci --resource-group "$rg" --query cl
 clusterId=$(az aks show --name "$cluster" --resource-group "$rg" --query id -o tsv)
 az role assignment create --assignee "$clientId" \
   --role "Azure Kubernetes Service Cluster User Role" --scope "$clusterId"
+# For an AKS cluster with Azure RBAC, also grant a write role such as
+# "Azure Kubernetes Service RBAC Writer" scoped to the staging and prod namespaces.
+```
+
+PowerShell:
+
+```powershell
+$clientId = az identity show --name delivery-ci --resource-group $rg --query clientId -o tsv
+$clusterId = az aks show --name $cluster --resource-group $rg --query id -o tsv
+az role assignment create --assignee $clientId `
+  --role "Azure Kubernetes Service Cluster User Role" --scope $clusterId
 # For an AKS cluster with Azure RBAC, also grant a write role such as
 # "Azure Kubernetes Service RBAC Writer" scoped to the staging and prod namespaces.
 ```
@@ -135,6 +182,25 @@ for repo in delivery-app-restaurants delivery-app-orders delivery-app-notificati
 done
 ```
 
+PowerShell:
+
+```powershell
+$clientId = az identity show --name delivery-ci --resource-group $rg --query clientId -o tsv
+$tenantId = az account show --query tenantId -o tsv
+$subId = az account show --query id -o tsv
+
+$repos = "delivery-app-restaurants", "delivery-app-orders", "delivery-app-notifications", "delivery-app-ui"
+foreach ($repo in $repos) {
+  gh secret set AZURE_CLIENT_ID       --repo "Cloud-Computing-FRI/$repo" --body $clientId
+  gh secret set AZURE_TENANT_ID       --repo "Cloud-Computing-FRI/$repo" --body $tenantId
+  gh secret set AZURE_SUBSCRIPTION_ID --repo "Cloud-Computing-FRI/$repo" --body $subId
+  gh secret set AKS_RESOURCE_GROUP    --repo "Cloud-Computing-FRI/$repo" --body $rg
+  gh secret set AKS_CLUSTER_NAME      --repo "Cloud-Computing-FRI/$repo" --body $cluster
+  gh secret set DOCKERHUB_USERNAME    --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-username>"
+  gh secret set DOCKERHUB_TOKEN       --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-token>"
+}
+```
+
 ## Managing the cluster with kubectl
 
 Point `kubectl` at the AKS cluster. This merges the credentials into your
@@ -144,6 +210,14 @@ Point `kubectl` at the AKS cluster. This merges the credentials into your
 rg=$(az aks list --query "[0].resourceGroup" -o tsv)
 cluster=$(az aks list --query "[0].name" -o tsv)
 az aks get-credentials --resource-group "$rg" --name "$cluster"
+```
+
+PowerShell:
+
+```powershell
+$rg = az aks list --query "[0].resourceGroup" -o tsv
+$cluster = az aks list --query "[0].name" -o tsv
+az aks get-credentials --resource-group $rg --name $cluster
 ```
 
 Each environment is a namespace (`staging`, `prod`). Inspect what is running:
