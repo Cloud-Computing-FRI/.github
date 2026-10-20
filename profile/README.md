@@ -107,18 +107,40 @@ az identity show  --name delivery-ci --resource-group $rg --query clientId -o ts
 ```
 
 Because login uses OIDC, no client secret is stored. Add one federated
-credential per repository and environment so GitHub can exchange a token:
+credential per repository and environment so GitHub can exchange a token.
+
+Manage these on the managed identity with `az identity`, not in Entra ID. A
+university account often gets a 401 "You do not have access" on the Entra ID
+pages, and the managed identity does not need them.
+
+The credential subject must use GitHub's ID-based format, which is what the
+tokens for these repositories carry:
+
+```
+repo:<org>@<orgId>/<repo>@<repoId>:environment:<staging|prod>
+```
+
+A plain `repo:Cloud-Computing-FRI/<repo>:environment:<env>` subject fails the
+login with `AADSTS700213: No matching federated identity record found`. The
+`subject claim` line in the `azure/login` log shows the exact value GitHub sends.
+Look up the organization and repository IDs with `gh`:
 
 ```bash
+orgId=$(gh api orgs/Cloud-Computing-FRI --jq .id)
+
 for repo in delivery-app-restaurants delivery-app-orders delivery-app-notifications delivery-app-ui; do
+  repoId=$(gh api "repos/Cloud-Computing-FRI/$repo" --jq .id)
+  [ -z "$repoId" ] && { echo "No repo id for $repo, skipping"; continue; }
   for env in staging prod; do
+    az identity federated-credential delete --identity-name delivery-ci \
+      --resource-group "$rg" --name "github-${repo}-${env}-id" --yes 2>/dev/null
     az identity federated-credential create \
-      --name "${repo}-${env}" \
+      --name "github-${repo}-${env}-id" \
       --identity-name delivery-ci \
       --resource-group "$rg" \
       --issuer https://token.actions.githubusercontent.com \
-      --subject "repo:Cloud-Computing-FRI/${repo}:environment:${env}" \
-      --audience api://AzureADTokenExchange
+      --subject "repo:Cloud-Computing-FRI@${orgId}/${repo}@${repoId}:environment:${env}" \
+      --audiences api://AzureADTokenExchange
   done
 done
 ```
@@ -126,18 +148,33 @@ done
 PowerShell:
 
 ```powershell
+$orgId = gh api orgs/Cloud-Computing-FRI --jq .id
 $repos = "delivery-app-restaurants", "delivery-app-orders", "delivery-app-notifications", "delivery-app-ui"
 foreach ($repo in $repos) {
+  $repoId = gh api "repos/Cloud-Computing-FRI/$repo" --jq .id
+  if (-not $repoId) { Write-Warning "No repo id for $repo, skipping"; continue }
   foreach ($env in "staging", "prod") {
+    az identity federated-credential delete --identity-name delivery-ci `
+      --resource-group $rg --name "github-$repo-$env-id" --yes 2>$null
     az identity federated-credential create `
-      --name "$repo-$env" `
+      --name "github-$repo-$env-id" `
       --identity-name delivery-ci `
       --resource-group $rg `
       --issuer https://token.actions.githubusercontent.com `
-      --subject "repo:Cloud-Computing-FRI/${repo}:environment:$env" `
-      --audience api://AzureADTokenExchange
+      --subject "repo:Cloud-Computing-FRI@${orgId}/${repo}@${repoId}:environment:${env}" `
+      --audiences api://AzureADTokenExchange
   }
 }
+```
+
+The braces around the variables in the subject are required in PowerShell;
+otherwise `$repo:environment` parses as a scope-qualified variable. Check the
+result: there should be 8 credentials and no subject containing `@:` (an empty
+ID). Azure can take a minute to apply new credentials.
+
+```bash
+az identity federated-credential list --identity-name delivery-ci \
+  --resource-group "$rg" --query "[].{name:name, subject:subject}" -o table
 ```
 
 Give that identity access to pull the kubeconfig and deploy into the cluster:
@@ -230,7 +267,10 @@ foreach ($repo in $repos.Split(",")) {
 }
 ```
 
-Organization secrets only reach private repositories on a paid GitHub plan. The
+On the GitHub Free plan, organization secrets only reach **public** repositories.
+In a private repository they read as empty, and `azure/login` fails with
+`Not all values are present. Ensure 'client-id' and 'tenant-id' are supplied.`
+Keep the four repositories public, or use a paid plan for private ones. The
 federated credentials above stay per repository and environment, so they are
 unaffected.
 
