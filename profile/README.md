@@ -37,10 +37,126 @@ In each repository open **Settings > Environments > prod** and add yourself or
 the team under **Required reviewers**. A prod deploy then pauses until someone
 approves it.
 
+## Prod database (Azure Database for PostgreSQL)
+
+Staging runs a Postgres pod per service, seeded automatically from
+`helm/files/init.sql`. Prod does not: its `values-prod.yaml` sets
+`postgresql.enabled: false` and reads `DATABASE_URL` from a Secret that must
+exist before the deploy (`db-restaurants`, `db-orders`, `db-notifications`).
+Without it the pods stay in `CreateContainerConfigError` (`secret "db-..." not
+found`). Set it up once, in this order.
+
+### 1. Create the server (portal)
+
+In the Azure portal open **Azure Database for PostgreSQL flexible servers** and
+click **Create**:
+
+- Resource group `rg-1`, region the same as the cluster (Austria East).
+- Server name: it becomes `<name>.postgres.database.azure.com` and must be unique
+  across all of Azure. A plain name like `delivery-app-pg` is usually taken
+  ("server name must be available"), so add a random suffix.
+- Workload type **Development** (Burstable B1ms, 32 GB), high availability off.
+- Authentication **PostgreSQL authentication only**. Pick an admin username
+  (`pgadmin`) and a password, and save the password: it is not shown again. Use
+  letters and digits only, or URL-encode special characters (`@` -> `%40`,
+  `/` -> `%2F`, `#` -> `%23`) when it goes into the connection string below.
+- Networking: **Public access**. Leave "Allow public access from any Azure
+  service" off, since the firewall rule below is enough.
+
+Creation takes several minutes. The server costs about 21 USD a month while
+running. Stopping it (**Stop** in the portal, or `az postgres flexible-server
+stop`) halts the compute charge, but Azure restarts a stopped server after 7 days.
+
+### 2. Create the databases (portal)
+
+Open the server, then **Databases** > **Add**, once each for `restaurants`,
+`orders` and `notifications`. The charts expect exactly those names.
+
+### 3. Allow the cluster through the firewall (portal)
+
+Pods reach the server from the cluster's outbound IP. Find it:
+
+```powershell
+$ipId = az aks show -g $rg -n $cluster --query "networkProfile.loadBalancerProfile.effectiveOutboundIPs[0].id" -o tsv
+az network public-ip show --ids $ipId --query ipAddress -o tsv
+```
+
+On the server open **Networking** > **Add firewall rule**, name it `aks-egress`,
+enter that address as both start and end IP, and save. Without this rule requests
+hang and the services log `psycopg.errors.ConnectionTimeout`, so the UI shows
+"Can't reach the restaurants service". If the cluster is stopped and started the
+address can change, and the rule must be updated.
+
+### 4. Create the Secrets and restart the services
+
+```powershell
+$server = "<server-name>.postgres.database.azure.com"
+$user = "pgadmin"
+$pass = "<admin-password>"
+foreach ($db in "restaurants", "orders", "notifications") {
+  kubectl -n prod delete secret "db-$db" --ignore-not-found
+  kubectl -n prod create secret generic "db-$db" `
+    --from-literal=DATABASE_URL="postgresql://${user}:${pass}@${server}:5432/${db}?sslmode=require"
+}
+kubectl -n prod rollout restart deploy/restaurants deploy/orders deploy/notifications
+```
+
+`sslmode=require` is needed because Azure rejects unencrypted connections. Pods
+read the Secret only when they start, so rerun the `rollout restart` after every
+change to it.
+
+### 5. Create the tables
+
+The databases are empty. Run each service's `helm/files/init.sql` once against
+its own database, from a temporary pod that reads the Secret created above (run
+from the folder that contains the four repository checkouts):
+
+```powershell
+foreach ($s in "restaurants", "orders", "notifications") {
+  kubectl -n prod create configmap "db-init-$s" --from-file=init.sql="delivery-app-$s/helm/files/init.sql"
+  @"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db-init-$s
+spec:
+  restartPolicy: Never
+  containers:
+    - name: psql
+      image: postgres:16-alpine
+      command: ["sh", "-c", 'psql "`$DATABASE_URL" -v ON_ERROR_STOP=1 -f /init/init.sql']
+      env:
+        - name: DATABASE_URL
+          valueFrom: {secretKeyRef: {name: db-$s, key: DATABASE_URL}}
+      volumeMounts:
+        - {name: init, mountPath: /init}
+  volumes:
+    - name: init
+      configMap: {name: db-init-$s}
+"@ | kubectl -n prod apply -f -
+}
+
+foreach ($s in "restaurants", "orders", "notifications") {
+  kubectl -n prod wait --for=jsonpath='{.status.phase}'=Succeeded "pod/db-init-$s" --timeout=120s
+  kubectl -n prod logs "db-init-$s"
+  kubectl -n prod delete pod,configmap "db-init-$s"
+}
+```
+
+The logs show `CREATE TABLE` for each service, plus the seed rows for
+restaurants. The scripts are not idempotent: running them again fails with
+`relation ... already exists`, which changes nothing. Check the result:
+
+```powershell
+curl.exe http://<prod-EXTERNAL-IP>/api/restaurants   # the three seeded restaurants
+curl.exe http://<prod-EXTERNAL-IP>/api/orders        # [] until an order is placed
+```
+
 ## Deploying to prod
 
 Each repository's prod deploy is a separate manual run, and the repositories do
-not trigger each other. Deploy the three backends first. The UI's nginx resolves
+not trigger each other. Set up the prod database first (above), then deploy the
+three backends before the UI. The UI's nginx resolves
 the `restaurants`, `orders` and `notifications` Services when it starts, so it
 crashes if they are not in the namespace yet.
 
@@ -260,6 +376,18 @@ ready` only says the pods never became ready. Find out why with
 | --- | --- |
 | `ImagePullBackOff` | The image tag does not exist. Prod deploys the SHA of the commit it runs on, and only a push to `main` builds that image. Check that `https://hub.docker.com/r/<username>/<repo>/tags` has the SHA, push a commit to `main` if it does not, then run prod again from `main`. |
 | `CrashLoopBackOff` on the UI | `kubectl -n <ns> logs deploy/ui --previous` shows `host not found in upstream`. A backend Service (`restaurants`, `orders` or `notifications`) is missing from that namespace. Deploy the backends first, then re-run the UI job. |
+| `CreateContainerConfigError` on a backend in prod | The `db-<service>` Secret does not exist. Create it (see "Prod database"). |
+
+Pods that are `Running` but whose API calls fail (the UI says "Can't reach the
+restaurants service", or `/api/...` returns 500 or hangs) are a database problem.
+`kubectl -n prod logs deploy/restaurants --tail=40` ends with the cause:
+
+| Log error | Cause and fix |
+| --- | --- |
+| `Name or service not known` | The host in the Secret does not exist. Use the exact server name from the portal and recreate the Secrets. |
+| `ConnectionTimeout` / `connection timeout expired` | The cluster's outbound IP is not in the server firewall. Add it. |
+| `password authentication failed for user` | Wrong password or username in the Secret. Reset the password on the server and recreate the Secrets. |
+| `relation "..." does not exist` | The tables are missing. Run `init.sql` (step 5 of "Prod database"). |
 
 After fixing the cause, use **Re-run failed jobs** on the workflow run. Helm
 upgrades a `failed` release in place, so no cleanup is needed.
