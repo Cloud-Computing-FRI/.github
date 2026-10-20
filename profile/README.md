@@ -36,8 +36,11 @@ approves it.
 
 ## Required GitHub secrets
 
-Set these in every service repository under
-**Settings > Secrets and variables > Actions**.
+Set these once as organization secrets under the organization's
+**Settings > Secrets and variables > Actions**, with **Repository access** set to
+the four service repositories. The workflows read them as `secrets.<NAME>`, so
+the repositories need no secrets of their own. A repository-level secret with
+the same name would override the organization value, so do not create one.
 
 | Secret | Purpose |
 | --- | --- |
@@ -164,22 +167,28 @@ The two Docker Hub values come from Docker Hub itself. Create the token under
 
 ### Loading the secrets with the GitHub CLI
 
-With the values in hand, push them to all four repositories at once:
+Creating organization secrets needs the `admin:org` scope on your GitHub token:
+
+```bash
+gh auth refresh -s admin:org
+```
+
+With the values in hand, set each secret once for the whole organization and
+limit it to the four service repositories:
 
 ```bash
 clientId=$(az identity show --name delivery-ci --resource-group "$rg" --query clientId -o tsv)
 tenantId=$(az account show --query tenantId -o tsv)
 subId=$(az account show --query id -o tsv)
+repos="delivery-app-restaurants,delivery-app-orders,delivery-app-notifications,delivery-app-ui"
 
-for repo in delivery-app-restaurants delivery-app-orders delivery-app-notifications delivery-app-ui; do
-  gh secret set AZURE_CLIENT_ID       --repo "Cloud-Computing-FRI/$repo" --body "$clientId"
-  gh secret set AZURE_TENANT_ID       --repo "Cloud-Computing-FRI/$repo" --body "$tenantId"
-  gh secret set AZURE_SUBSCRIPTION_ID --repo "Cloud-Computing-FRI/$repo" --body "$subId"
-  gh secret set AKS_RESOURCE_GROUP    --repo "Cloud-Computing-FRI/$repo" --body "$rg"
-  gh secret set AKS_CLUSTER_NAME      --repo "Cloud-Computing-FRI/$repo" --body "$cluster"
-  gh secret set DOCKERHUB_USERNAME    --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-username>"
-  gh secret set DOCKERHUB_TOKEN       --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-token>"
-done
+gh secret set AZURE_CLIENT_ID       --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "$clientId"
+gh secret set AZURE_TENANT_ID       --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "$tenantId"
+gh secret set AZURE_SUBSCRIPTION_ID --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "$subId"
+gh secret set AKS_RESOURCE_GROUP    --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "$rg"
+gh secret set AKS_CLUSTER_NAME      --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "$cluster"
+gh secret set DOCKERHUB_USERNAME    --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "<dockerhub-username>"
+gh secret set DOCKERHUB_TOKEN       --org Cloud-Computing-FRI --visibility selected --repos "$repos" --body "<dockerhub-token>"
 ```
 
 PowerShell:
@@ -188,18 +197,42 @@ PowerShell:
 $clientId = az identity show --name delivery-ci --resource-group $rg --query clientId -o tsv
 $tenantId = az account show --query tenantId -o tsv
 $subId = az account show --query id -o tsv
+$repos = "delivery-app-restaurants,delivery-app-orders,delivery-app-notifications,delivery-app-ui"
 
-$repos = "delivery-app-restaurants", "delivery-app-orders", "delivery-app-notifications", "delivery-app-ui"
-foreach ($repo in $repos) {
-  gh secret set AZURE_CLIENT_ID       --repo "Cloud-Computing-FRI/$repo" --body $clientId
-  gh secret set AZURE_TENANT_ID       --repo "Cloud-Computing-FRI/$repo" --body $tenantId
-  gh secret set AZURE_SUBSCRIPTION_ID --repo "Cloud-Computing-FRI/$repo" --body $subId
-  gh secret set AKS_RESOURCE_GROUP    --repo "Cloud-Computing-FRI/$repo" --body $rg
-  gh secret set AKS_CLUSTER_NAME      --repo "Cloud-Computing-FRI/$repo" --body $cluster
-  gh secret set DOCKERHUB_USERNAME    --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-username>"
-  gh secret set DOCKERHUB_TOKEN       --repo "Cloud-Computing-FRI/$repo" --body "<dockerhub-token>"
+gh secret set AZURE_CLIENT_ID       --org Cloud-Computing-FRI --visibility selected --repos $repos --body $clientId
+gh secret set AZURE_TENANT_ID       --org Cloud-Computing-FRI --visibility selected --repos $repos --body $tenantId
+gh secret set AZURE_SUBSCRIPTION_ID --org Cloud-Computing-FRI --visibility selected --repos $repos --body $subId
+gh secret set AKS_RESOURCE_GROUP    --org Cloud-Computing-FRI --visibility selected --repos $repos --body $rg
+gh secret set AKS_CLUSTER_NAME      --org Cloud-Computing-FRI --visibility selected --repos $repos --body $cluster
+gh secret set DOCKERHUB_USERNAME    --org Cloud-Computing-FRI --visibility selected --repos $repos --body "<dockerhub-username>"
+gh secret set DOCKERHUB_TOKEN       --org Cloud-Computing-FRI --visibility selected --repos $repos --body "<dockerhub-token>"
+```
+
+If the repositories already have secrets of the same names, remove them so the
+organization values apply:
+
+```bash
+for repo in ${repos//,/ }; do
+  for s in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AKS_RESOURCE_GROUP AKS_CLUSTER_NAME DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+    gh secret delete "$s" --repo "Cloud-Computing-FRI/$repo"
+  done
+done
+```
+
+PowerShell:
+
+```powershell
+$secretNames = "AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID", "AKS_RESOURCE_GROUP", "AKS_CLUSTER_NAME", "DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"
+foreach ($repo in $repos.Split(",")) {
+  foreach ($s in $secretNames) {
+    gh secret delete $s --repo "Cloud-Computing-FRI/$repo"
+  }
 }
 ```
+
+Organization secrets only reach private repositories on a paid GitHub plan. The
+federated credentials above stay per repository and environment, so they are
+unaffected.
 
 ## Managing the cluster with kubectl
 
