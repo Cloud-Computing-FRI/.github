@@ -51,11 +51,10 @@ Set these in every service repository under
 
 ### Retrieving the values with the Azure CLI
 
-Sign in and select the subscription you deploy into:
+Sign in:
 
 ```bash
 az login
-az account set --subscription "<subscription name or id>"
 ```
 
 Read the tenant and subscription IDs:
